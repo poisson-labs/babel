@@ -1,0 +1,41 @@
+# @package _global_
+
+defaults:
+  - /env: resource_logistics_v1
+  - _self_
+
+mode: train_eval
+seeds: [0, 1]
+device: cpu
+
+total_timesteps: 5000000
+num_envs: 16
+rollout_length: 128
+ppo_epochs: 4
+minibatch_size: 1024
+learning_rate: 0.0003
+clip_coef: 0.2
+gae_lambda: 0.95
+gamma: 0.99
+entropy_coef: 0.01
+value_coef: 0.5
+max_grad_norm: 0.5
+log_interval_updates: 10
+
+eval_episodes: 500
+eval_seed: 100000
+bootstrap_resamples: 1000
+gate_low: 0.25
+gate_high: 0.45
+
+checkpoint_dir: artifacts/checkpoints
+summary_path: artifacts/phase1_ippo_summary.json
+eval_checkpoint_paths: []
+save_eval_replays: false
+eval_replay_dir: artifacts/eval_replays
+
+wandb:
+  project: babel
+  group: phase1_ippo
+  mode: online
+  enabled: true

@@ -6,7 +6,7 @@ Babel is a Poisson Labs research project studying communication-channel robustne
 
 | Gate | Section | Success criterion | Status |
 | --- | --- | --- | --- |
-| Step 1 | Environment + IPPO baseline | IPPO reaches 25-45% demand satisfaction over 500 eval episodes | not started |
+| Step 1 | Environment + IPPO baseline | IPPO reaches 25-45% demand satisfaction over 500 eval episodes | passed: 34.3% demand satisfaction, 95% CI 32.9%-35.8% over 1000 eval episodes |
 | Step 2 | Symbolic channel + MAPPO | MAPPO+symbolic reaches 70-85% demand satisfaction and 30+ point gap over IPPO | not started |
 | Step 3 | Latent VQ channel | Latent VQ MAPPO is within 5 points of symbolic | not started |
 | Step 4 | NL channel | NL MAPPO is within 8 points of symbolic and empirical bits/message is about 8 | not started |
@@ -19,5 +19,4 @@ Babel is a Poisson Labs research project studying communication-channel robustne
 | Step 11 | Forensic analysis + replay clips | Blog-ready exemplar failure episodes and clips are selected | not started |
 | Step 12 | Write the post | 5000-6000 word blog post is drafted with figures and clips | not started |
 
-Current gate: §9 Step 1, Environment + IPPO baseline. No gate work has started yet.
-
+Current gate: §9 Step 2, Symbolic channel + MAPPO. Do not start Step 2 until explicitly prompted.
