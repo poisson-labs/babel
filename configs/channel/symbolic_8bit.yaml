@@ -1,0 +1,5 @@
+message_dim: 16
+hidden_dim: 128
+initial_temperature: 1.0
+min_temperature: 0.2
+anneal_steps: 1000000

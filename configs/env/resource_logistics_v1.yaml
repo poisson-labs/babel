@@ -11,4 +11,6 @@ depot_inventory_min: 3
 depot_inventory_max: 5
 replenishment_rate: 0.1
 max_demands: 8
+message_dim: 0
+message_history_length: 5
 replay_path: null

@@ -9,7 +9,6 @@ from pettingzoo import ParallelEnv
 
 from babel.env.dynamics import (
     ACTION_DIM,
-    OBSERVATION_DIM,
     ResourceLogisticsConfig,
     ResourceLogisticsEnv,
 )
@@ -26,7 +25,7 @@ class ResourceLogisticsParallelEnv(ParallelEnv[str, NDArray[np.float32], int]):
         self._observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(OBSERVATION_DIM,),
+            shape=(self.base_env.config.observation_dim,),
             dtype=np.float32,
         )
         self._action_space: spaces.Discrete[Any] = spaces.Discrete(ACTION_DIM)

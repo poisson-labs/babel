@@ -4,6 +4,8 @@ import msgpack
 import numpy as np
 from babel.env.dynamics import (
     ACTION_DIM,
+    GLOBAL_STATE_DIM,
+    MESSAGE_HISTORY_OFFSET,
     NUM_AGENTS,
     OBSERVATION_DIM,
     ResourceLogisticsConfig,
@@ -41,6 +43,10 @@ def test_env_reset_step_and_action_masks_are_well_formed() -> None:
     assert all(obs.shape == (OBSERVATION_DIM,) for obs in observations.values())
     assert all(np.isfinite(obs).all() for obs in observations.values())
     assert all("action_mask" in info for info in infos.values())
+
+    global_state = env.global_state_features()
+    assert global_state.shape == (GLOBAL_STATE_DIM,)
+    assert np.isfinite(global_state).all()
 
     action_masks = env.action_masks()
     for agent_id, mask in action_masks.items():
@@ -95,3 +101,30 @@ def test_replay_round_trip_records_exhaustive_episode(tmp_path) -> None:
     with replay_path.open("rb") as handle:
         packed = msgpack.unpackb(handle.read(), raw=False)
     assert packed == replay
+
+
+def test_message_history_component_is_zero_until_messages_arrive() -> None:
+    env = ResourceLogisticsEnv(ResourceLogisticsConfig(message_dim=16), seed=222)
+    observations, _ = env.reset(seed=222)
+    message_end = MESSAGE_HISTORY_OFFSET + env.config.message_history_length * 3 * 16
+
+    assert env.config.observation_dim == OBSERVATION_DIM + 5 * 3 * 16
+    assert all(obs.shape == (env.config.observation_dim,) for obs in observations.values())
+    assert all(
+        np.allclose(obs[MESSAGE_HISTORY_OFFSET:message_end], 0.0) for obs in observations.values()
+    )
+
+    sender = env.possible_agents[0]
+    receiver = env.possible_agents[1]
+    embedding = np.ones(16, dtype=np.float32)
+    actions = {agent: env.noop_action for agent in env.possible_agents}
+    actions[sender] = {
+        "movement": env.noop_action,
+        "message_embeddings": {receiver: embedding},
+        "message_raw": {"slots": [1, 2, 1]},
+    }
+
+    next_observations, _, _, _, _ = env.step(actions)
+    receiver_history = next_observations[receiver][MESSAGE_HISTORY_OFFSET:message_end]
+
+    assert np.count_nonzero(receiver_history) == 16

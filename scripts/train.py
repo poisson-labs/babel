@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,13 @@ from babel.algorithms.ippo import (
     evaluate_checkpoint,
     train_ippo,
 )
+from babel.algorithms.mappo import (
+    MAPPOTrainConfig,
+    SymbolicChannelConfig,
+    evaluate_gate2,
+    evaluate_symbolic_checkpoint,
+    train_mappo_symbolic,
+)
 from babel.env.dynamics import ResourceLogisticsConfig
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
@@ -19,7 +27,15 @@ from omegaconf import DictConfig, OmegaConf
 
 @hydra.main(version_base=None, config_path="../configs", config_name="algo/ippo")
 def main(cfg: DictConfig) -> None:
+    _load_dotenv_file()
     env_config = _env_config_from_cfg(cfg.env)
+    if str(cfg.get("algorithm", "ippo")) == "mappo_symbolic":
+        _run_mappo_symbolic(cfg, env_config)
+        return
+    _run_ippo(cfg, env_config)
+
+
+def _run_ippo(cfg: DictConfig, env_config: ResourceLogisticsConfig) -> None:
     checkpoint_paths: list[Path] = []
     train_results: list[dict[str, Any]] = []
 
@@ -107,6 +123,119 @@ def main(cfg: DictConfig) -> None:
     print(f"Wrote summary to {summary_path}")
 
 
+def _run_mappo_symbolic(cfg: DictConfig, env_config: ResourceLogisticsConfig) -> None:
+    channel_config = _symbolic_channel_config_from_cfg(cfg.channel)
+    checkpoint_paths: list[Path] = []
+    train_results: list[dict[str, Any]] = []
+
+    if cfg.mode in {"train", "train_eval"}:
+        for seed in list(cfg.seeds):
+            train_config = _mappo_train_config_from_cfg(cfg, int(seed))
+            result = train_mappo_symbolic(
+                env_config=env_config,
+                train_config=train_config,
+                channel_config=channel_config,
+            )
+            checkpoint_paths.append(result.checkpoint_path)
+            train_results.append(
+                {
+                    "seed": result.seed,
+                    "checkpoint_path": str(result.checkpoint_path),
+                    "global_step": result.global_step,
+                    "updates": result.updates,
+                    "elapsed_seconds": result.elapsed_seconds,
+                    "recent_satisfaction": result.recent_satisfaction,
+                }
+            )
+
+    if cfg.mode == "eval":
+        checkpoint_paths = [
+            Path(to_absolute_path(path)) for path in list(cfg.eval_checkpoint_paths)
+        ]
+
+    eval_results: list[dict[str, Any]] = []
+    all_satisfaction_rates: list[float] = []
+    if cfg.mode in {"eval", "train_eval"}:
+        for index, checkpoint_path in enumerate(checkpoint_paths):
+            result = evaluate_symbolic_checkpoint(
+                checkpoint_path=checkpoint_path,
+                env_config=env_config,
+                episodes=int(cfg.eval_episodes),
+                seed=int(cfg.eval_seed) + index * int(cfg.eval_episodes),
+                device=str(cfg.device),
+            )
+            all_satisfaction_rates.extend(result.satisfaction_rates)
+            eval_results.append(
+                {
+                    "checkpoint_path": str(result.checkpoint_path),
+                    "episodes": result.episodes,
+                    "mean_satisfaction": result.mean_satisfaction,
+                    "mean_reward": result.mean_reward,
+                }
+            )
+
+    summary: dict[str, Any] = {
+        "mode": str(cfg.mode),
+        "train": train_results,
+        "eval": eval_results,
+    }
+    if all_satisfaction_rates:
+        gate = evaluate_gate2(
+            all_satisfaction_rates,
+            seed=int(cfg.eval_seed),
+            resamples=int(cfg.bootstrap_resamples),
+            ippo_point_estimate=float(cfg.ippo_point_estimate),
+            ippo_upper_ci=float(cfg.ippo_upper_ci),
+        )
+        summary["gate"] = {
+            **asdict(gate.ci),
+            "episodes": len(all_satisfaction_rates),
+            "ippo_point_estimate": float(cfg.ippo_point_estimate),
+            "ippo_upper_ci": float(cfg.ippo_upper_ci),
+            "gap_vs_ippo_point": gate.ippo_point_gap,
+            "conservative_gap_vs_ippo_upper_ci": gate.ippo_upper_ci_gap,
+            "status": gate.status,
+            "passed": gate.passed,
+            "gate_low": float(cfg.gate_low),
+            "gate_high": float(cfg.gate_high),
+            "borderline_pass_low": float(cfg.borderline_pass_low),
+        }
+        print(
+            "Phase 2 symbolic MAPPO demand satisfaction: "
+            f"{gate.ci.mean:.3f} (95% CI {gate.ci.low:.3f}-{gate.ci.high:.3f}, "
+            f"n={len(all_satisfaction_rates)})"
+        )
+        print(
+            "Gap vs IPPO point estimate: "
+            f"{gate.ippo_point_gap * 100:.1f}pp; conservative gap vs IPPO upper CI: "
+            f"{gate.ippo_upper_ci_gap * 100:.1f}pp"
+        )
+        if gate.status == "passed":
+            print("✅ GATE 2 PASSED")
+        elif gate.status == "borderline_pass_gap_ok_below_band":
+            print(
+                "BORDERLINE-PASS: gap is >=30pp, but mean is below the original "
+                "[70%, 85%] band. Ask for confirmation before declaring Gate 2 passed."
+            )
+        elif gate.status == "borderline_gap_20_to_30pp":
+            print(
+                "BORDERLINE: communication gap is 20-30pp. Do not declare Gate 2 passed; "
+                "ask whether to proceed or recalibrate."
+            )
+        elif gate.status == "fail_comm_gap_lt_20pp":
+            print(
+                "GATE 2 FAILED: gap is <20pp. The env does not reward communication enough; "
+                "return to Step 1 calibration."
+            )
+        else:
+            print("GATE 2 FAILED: mean is outside the target band.")
+
+    summary_path = Path(to_absolute_path(str(cfg.summary_path)))
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+    print(f"Wrote summary to {summary_path}")
+
+
 def _env_config_from_cfg(cfg: DictConfig) -> ResourceLogisticsConfig:
     data = OmegaConf.to_container(cfg, resolve=True)
     if not isinstance(data, dict):
@@ -125,6 +254,8 @@ def _env_config_from_cfg(cfg: DictConfig) -> ResourceLogisticsConfig:
         depot_inventory_max=int(data["depot_inventory_max"]),
         replenishment_rate=float(data["replenishment_rate"]),
         max_demands=int(data["max_demands"]),
+        message_dim=int(data.get("message_dim", 0)),
+        message_history_length=int(data.get("message_history_length", 5)),
         replay_path=data["replay_path"],
     )
 
@@ -153,6 +284,55 @@ def _train_config_from_cfg(cfg: DictConfig, seed: int) -> IPPOTrainConfig:
         track_wandb=bool(cfg.wandb.enabled),
         log_interval_updates=int(cfg.log_interval_updates),
     )
+
+
+def _symbolic_channel_config_from_cfg(cfg: DictConfig) -> SymbolicChannelConfig:
+    return SymbolicChannelConfig(
+        message_dim=int(cfg.message_dim),
+        hidden_dim=int(cfg.hidden_dim),
+        initial_temperature=float(cfg.initial_temperature),
+        min_temperature=float(cfg.min_temperature),
+        anneal_steps=int(cfg.anneal_steps),
+    )
+
+
+def _mappo_train_config_from_cfg(cfg: DictConfig, seed: int) -> MAPPOTrainConfig:
+    return MAPPOTrainConfig(
+        total_timesteps=int(cfg.total_timesteps),
+        num_envs=int(cfg.num_envs),
+        rollout_length=int(cfg.rollout_length),
+        ppo_epochs=int(cfg.ppo_epochs),
+        minibatch_size=int(cfg.minibatch_size),
+        learning_rate=float(cfg.learning_rate),
+        channel_learning_rate=float(cfg.channel_learning_rate),
+        clip_coef=float(cfg.clip_coef),
+        gae_lambda=float(cfg.gae_lambda),
+        gamma=float(cfg.gamma),
+        entropy_coef=float(cfg.entropy_coef),
+        value_coef=float(cfg.value_coef),
+        max_grad_norm=float(cfg.max_grad_norm),
+        seed=seed,
+        device=str(cfg.device),
+        checkpoint_dir=Path(to_absolute_path(str(cfg.checkpoint_dir))),
+        checkpoint_name=f"mappo_symbolic_seed_{seed}.pt",
+        wandb_project=str(cfg.wandb.project),
+        wandb_group=str(cfg.wandb.group),
+        wandb_mode=str(cfg.wandb.mode),
+        track_wandb=bool(cfg.wandb.enabled),
+        log_interval_updates=int(cfg.log_interval_updates),
+    )
+
+
+def _load_dotenv_file() -> None:
+    env_path = Path(to_absolute_path(".env"))
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
 if __name__ == "__main__":

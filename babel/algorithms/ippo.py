@@ -18,7 +18,6 @@ from torch.distributions import Categorical
 from babel.env.dynamics import (
     ACTION_DIM,
     NUM_AGENTS,
-    OBSERVATION_DIM,
     ResourceLogisticsConfig,
     ResourceLogisticsEnv,
 )
@@ -105,8 +104,9 @@ def train_ippo(
         observations.append(obs)
         infos.append(info)
 
-    actor = IPPOActor().to(device)
-    critic = IPPOCritic().to(device)
+    observation_dim = env_config.observation_dim
+    actor = IPPOActor(observation_dim=observation_dim).to(device)
+    critic = IPPOCritic(observation_dim=observation_dim).to(device)
     optimizer = torch.optim.Adam(
         list(actor.parameters()) + list(critic.parameters()),
         lr=train_config.learning_rate,
@@ -127,7 +127,7 @@ def train_ippo(
 
     for update in range(1, updates + 1):
         obs_buf = torch.zeros(
-            (train_config.rollout_length, batch_size, OBSERVATION_DIM), device=device
+            (train_config.rollout_length, batch_size, observation_dim), device=device
         )
         mask_buf = torch.zeros(
             (train_config.rollout_length, batch_size, ACTION_DIM), dtype=torch.bool, device=device
@@ -219,7 +219,7 @@ def train_ippo(
             )
             returns = advantages + value_buf
 
-        flat_obs = obs_buf.reshape((-1, OBSERVATION_DIM))
+        flat_obs = obs_buf.reshape((-1, observation_dim))
         flat_masks = mask_buf.reshape((-1, ACTION_DIM))
         flat_actions = action_buf.reshape(-1)
         flat_logprobs = logprob_buf.reshape(-1)
@@ -328,7 +328,8 @@ def evaluate_checkpoint(
 ) -> EvaluationResult:
     torch_device = torch.device(device)
     checkpoint = torch.load(checkpoint_path, map_location=torch_device, weights_only=False)
-    actor = IPPOActor().to(torch_device)
+    env_observation_dim = env_config.observation_dim
+    actor = IPPOActor(observation_dim=env_observation_dim).to(torch_device)
     actor.load_state_dict(checkpoint["actor"])
     actor.eval()
 

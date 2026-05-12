@@ -23,9 +23,14 @@ NUM_RESOURCES: Final[int] = len(RESOURCE_TYPES)
 MAX_NEIGHBORHOOD_NODES: Final[int] = 8
 MAX_VISIBLE_DEMANDS: Final[int] = 4
 MAX_DEMANDS: Final[int] = 8
+MESSAGE_HISTORY_LENGTH: Final[int] = 5
 ACTION_DIM: Final[int] = 23
 NOOP_ACTION: Final[int] = 22
-OBSERVATION_DIM: Final[int] = 73
+BASE_OBSERVATION_DIM: Final[int] = 73
+MESSAGE_HISTORY_OFFSET: Final[int] = 64
+OBSERVATION_TAIL_DIM: Final[int] = BASE_OBSERVATION_DIM - MESSAGE_HISTORY_OFFSET
+OBSERVATION_DIM: Final[int] = BASE_OBSERVATION_DIM
+GLOBAL_STATE_DIM: Final[int] = 3 * NUM_RESOURCES + MAX_DEMANDS * (NUM_NODES + NUM_RESOURCES + 2)
 
 MOVE_OFFSET: Final[int] = 0
 PICKUP_OFFSET: Final[int] = 4
@@ -49,7 +54,16 @@ class ResourceLogisticsConfig:
     depot_inventory_max: int = 5
     replenishment_rate: float = 0.1
     max_demands: int = MAX_DEMANDS
+    message_dim: int = 0
+    message_history_length: int = MESSAGE_HISTORY_LENGTH
     replay_path: Path | str | None = None
+
+    @property
+    def observation_dim(self) -> int:
+        return (
+            BASE_OBSERVATION_DIM
+            + self.message_history_length * (self.num_agents - 1) * self.message_dim
+        )
 
     def to_dict(self) -> dict[str, JsonLike]:
         config = asdict(self)
@@ -123,6 +137,7 @@ class ResourceLogisticsEnv:
         self.demands: list[DemandEvent] = []
         self.depot_inventory: dict[int, list[int]] = {}
         self.recorder: ReplayRecorder | None = None
+        self.message_history: dict[str, NDArray[np.float32]] = {}
         self._finished = False
         self._last_observations: dict[str, NDArray[np.float32]] = {}
 
@@ -160,6 +175,7 @@ class ResourceLogisticsEnv:
             for depot in self.graph.depots()
         }
         self.demands = self._sample_demands()
+        self.message_history = self._empty_message_history()
         replay_path = Path(self.config.replay_path) if self.config.replay_path is not None else None
         self.recorder = ReplayRecorder(
             seed=self.base_seed, config=self.config.to_dict(), path=replay_path
@@ -172,7 +188,7 @@ class ResourceLogisticsEnv:
 
     def step(
         self,
-        actions: Mapping[str, int | Mapping[str, int]],
+        actions: Mapping[str, int | Mapping[str, object]],
     ) -> tuple[
         dict[str, NDArray[np.float32]],
         dict[str, float],
@@ -186,15 +202,18 @@ class ResourceLogisticsEnv:
             )
 
         observations_before = self._last_observations or self.observations()
+        action_payloads = {
+            agent: actions.get(agent, self.noop_action) for agent in self.possible_agents
+        }
         coerced_actions = {
-            agent: self._coerce_action(actions.get(agent, self.noop_action))
-            for agent in self.possible_agents
+            agent: self._coerce_action(action_payloads[agent]) for agent in self.possible_agents
         }
 
         team_reward = self._apply_actions(coerced_actions)
         self.step_count += 1
         team_reward += self._expire_demands()
         self._replenish_depots()
+        self._update_message_history(action_payloads)
 
         terminations = {
             agent: self._all_demands_resolved() and self.step_count < self.config.episode_length
@@ -209,7 +228,7 @@ class ResourceLogisticsEnv:
         infos = self.infos()
         self._last_observations = observations
 
-        self._record_step(observations_before, coerced_actions, rewards)
+        self._record_step(observations_before, action_payloads, coerced_actions, rewards)
 
         if all(terminations.values()) or all(truncations.values()):
             self._finished = True
@@ -227,6 +246,41 @@ class ResourceLogisticsEnv:
 
     def observations(self) -> dict[str, NDArray[np.float32]]:
         return {agent: self._observation_for(agent) for agent in self.possible_agents}
+
+    def global_state_features(self) -> NDArray[np.float32]:
+        depot_features = np.zeros((3, NUM_RESOURCES), dtype=np.float32)
+        for row, depot in enumerate(sorted(self.graph.depots())[:3]):
+            inventory = self.depot_inventory.get(depot, [0, 0])
+            inventory_scale = max(float(self.config.depot_inventory_max), 1.0)
+            depot_features[row] = np.clip(
+                np.array(inventory, dtype=np.float32) / inventory_scale,
+                0.0,
+                1.0,
+            )
+
+        demand_width = NUM_NODES + NUM_RESOURCES + 2
+        demand_features = np.zeros((self.config.max_demands, demand_width), dtype=np.float32)
+        active_demands = [demand for demand in self.demands if demand.status == "active"]
+        active_demands.sort(key=lambda demand: (demand.deadline, demand.demand_id))
+        for row, demand in enumerate(active_demands[: self.config.max_demands]):
+            demand_features[row, demand.node_id] = 1.0
+            demand_features[row, NUM_NODES + demand.resource_type] = 1.0
+            remaining = max(demand.deadline - self.step_count, 0)
+            demand_features[row, NUM_NODES + NUM_RESOURCES] = min(
+                float(remaining) / self.config.episode_length,
+                1.0,
+            )
+            demand_features[row, NUM_NODES + NUM_RESOURCES + 1] = float(demand.reward_value) / max(
+                self.config.reward_values
+            )
+
+        features = np.concatenate(
+            [depot_features.reshape(-1), demand_features.reshape(-1)],
+            dtype=np.float32,
+        )
+        if features.shape != (GLOBAL_STATE_DIM,):
+            raise RuntimeError(f"Global state shape {features.shape} != {(GLOBAL_STATE_DIM,)}")
+        return features
 
     def infos(self) -> dict[str, dict[str, Any]]:
         masks = self.action_masks()
@@ -279,6 +333,7 @@ class ResourceLogisticsEnv:
             "agent_commitments": {
                 agent: state.commitment for agent, state in self.agent_states.items()
             },
+            "message_history": {agent: history for agent, history in self.message_history.items()},
         }
 
     def _sample_demands(self) -> list[DemandEvent]:
@@ -448,12 +503,14 @@ class ResourceLogisticsEnv:
         parts.append(self._neighborhood_features(state.node_id))
         parts.append(self._local_depot_inventory_features(state.node_id))
         parts.append(self._local_demand_features(state.node_id))
+        parts.append(self._message_history_features(agent))
         parts.append(np.array([self.step_count / self.config.episode_length], dtype=np.float32))
         parts.append(self._commitment_features(state.commitment))
 
         observation = np.concatenate(parts, dtype=np.float32)
-        if observation.shape != (OBSERVATION_DIM,):
-            raise RuntimeError(f"Observation shape {observation.shape} != {(OBSERVATION_DIM,)}")
+        expected_shape = (self.config.observation_dim,)
+        if observation.shape != expected_shape:
+            raise RuntimeError(f"Observation shape {observation.shape} != {expected_shape}")
         return observation
 
     def _neighborhood_features(self, node_id: int) -> NDArray[np.float32]:
@@ -504,9 +561,73 @@ class ResourceLogisticsEnv:
             features[commitment] = 1.0
         return features
 
+    def _message_history_features(self, agent: str) -> NDArray[np.float32]:
+        if self.config.message_dim == 0:
+            return np.zeros(0, dtype=np.float32)
+        return self.message_history[agent].reshape(-1).astype(np.float32)
+
+    def _empty_message_history(self) -> dict[str, NDArray[np.float32]]:
+        return {
+            agent: np.zeros(
+                (
+                    self.config.message_history_length,
+                    self.config.num_agents - 1,
+                    self.config.message_dim,
+                ),
+                dtype=np.float32,
+            )
+            for agent in self.possible_agents
+        }
+
+    def _update_message_history(self, actions: Mapping[str, object]) -> None:
+        if self.config.message_dim == 0:
+            return
+        latest_by_receiver = {
+            receiver: np.zeros(
+                (self.config.num_agents - 1, self.config.message_dim),
+                dtype=np.float32,
+            )
+            for receiver in self.possible_agents
+        }
+        for receiver in self.possible_agents:
+            incoming = latest_by_receiver[receiver]
+            senders = [sender for sender in self.possible_agents if sender != receiver]
+            for sender_index, sender in enumerate(senders):
+                embedding = self._message_embedding_from_action(actions.get(sender), receiver)
+                if embedding is not None:
+                    incoming[sender_index] = embedding
+
+        for receiver, latest in latest_by_receiver.items():
+            history = self.message_history[receiver]
+            history[:-1] = history[1:]
+            history[-1] = latest
+
+    def _message_embedding_from_action(
+        self,
+        action: object,
+        receiver: str,
+    ) -> NDArray[np.float32] | None:
+        if not isinstance(action, Mapping):
+            return None
+        action_mapping = cast(Mapping[str, object], action)
+        message_embeddings = action_mapping.get("message_embeddings")
+        if not isinstance(message_embeddings, Mapping):
+            return None
+        embedding = cast(Mapping[str, object], message_embeddings).get(receiver)
+        if embedding is None:
+            return None
+        array = np.asarray(embedding, dtype=np.float32)
+        if array.shape != (self.config.message_dim,):
+            raise ValueError(
+                f"Message embedding for {receiver} has shape {array.shape}; "
+                f"expected {(self.config.message_dim,)}"
+            )
+        return array
+
     def _record_step(
         self,
         observations: Mapping[str, NDArray[np.float32]],
+        action_payloads: Mapping[str, object],
         actions: Mapping[str, int],
         rewards: Mapping[str, float],
     ) -> None:
@@ -519,9 +640,13 @@ class ResourceLogisticsEnv:
                     "agent_id": agent,
                     "obs": observations[agent],
                     "action": int(actions[agent]),
-                    "message_sent_raw": "",
-                    "message_sent_perturbed": "",
-                    "messages_received": [],
+                    "message_sent_raw": self._message_raw_from_action(action_payloads.get(agent)),
+                    "message_sent_perturbed": self._message_raw_from_action(
+                        action_payloads.get(agent)
+                    ),
+                    "messages_received": self.message_history.get(
+                        agent, np.zeros(0, dtype=np.float32)
+                    ),
                     "reward": float(rewards[agent]),
                 }
             )
@@ -539,6 +664,13 @@ class ResourceLogisticsEnv:
         if isinstance(action, Integral):
             return int(action)
         return self.noop_action
+
+    def _message_raw_from_action(self, action: object) -> JsonLike:
+        if not isinstance(action, Mapping):
+            return ""
+        action_mapping = cast(Mapping[str, object], action)
+        message_raw = action_mapping.get("message_raw", "")
+        return _json_value(message_raw)
 
 
 def _json_value(value: Any) -> JsonLike:
