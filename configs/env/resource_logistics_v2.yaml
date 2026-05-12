@@ -1,0 +1,15 @@
+num_nodes: 12
+num_agents: 4
+episode_length: 50
+inventory_capacity: 2
+initial_demands_min: 5
+initial_demands_max: 8
+# Calibrated against strict solo-completability metric; see docs/diagnostics/solo_completability_v2.md.
+deadline_min: 8
+deadline_max: 14
+reward_values: [1, 2, 3]
+depot_inventory_min: 2
+depot_inventory_max: 3
+replenishment_rate: 0.1
+max_demands: 8
+replay_path: null
