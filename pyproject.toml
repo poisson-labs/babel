@@ -3,6 +3,10 @@ name = "babel"
 version = "0.1.0"
 description = "Adversarial communication robustness study for cooperative multi-agent reinforcement learning."
 readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Taylor Kolasinski", email = "work@poissonlabs.ai" },
+]
 requires-python = ">=3.11"
 dependencies = [
     "einops>=0.8.0",
@@ -15,6 +19,10 @@ dependencies = [
     "transformers>=4.45.0",
     "wandb>=0.18.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/poisson-labs/babel"
+Repository = "https://github.com/poisson-labs/babel"
 
 [dependency-groups]
 dev = [
@@ -43,6 +51,7 @@ markers = [
 target-version = "py311"
 line-length = 100
 src = ["babel", "scripts", "tests"]
+extend-exclude = ["scratch", "runbooks"]
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "RUF", "UP"]
@@ -50,13 +59,3 @@ select = ["B", "E", "F", "I", "RUF", "UP"]
 [tool.ruff.format]
 quote-style = "double"
 line-ending = "lf"
-
-[tool.pyright]
-include = ["babel"]
-exclude = ["**/__pycache__", ".venv"]
-venvPath = "."
-venv = ".venv"
-pythonVersion = "3.11"
-typeCheckingMode = "strict"
-reportMissingTypeStubs = "none"
-reportPrivateImportUsage = "none"
