@@ -17,3 +17,17 @@ data/
 checkpoints/
 replays/
 
+# Devlogs live in the vault only (repo-hygiene standard section 2.7)
+devlog.md
+DEVLOG*
+devlog*
+
+# Tooling and IDE configs
+.claude/
+.cursor/
+.vscode/
+.idea/
+
+# Scratch and runbooks
+scratch/
+runbooks/
