@@ -16,8 +16,6 @@ from torch import nn
 from torch.distributions import Categorical
 
 from babel.env.dynamics import (
-    ACTION_DIM,
-    NUM_AGENTS,
     ResourceLogisticsConfig,
     ResourceLogisticsEnv,
 )
@@ -105,14 +103,16 @@ def train_ippo(
         infos.append(info)
 
     observation_dim = env_config.observation_dim
-    actor = IPPOActor(observation_dim=observation_dim).to(device)
+    num_agents = env_config.num_agents
+    action_dim_val = env_config.action_dim
+    actor = IPPOActor(observation_dim=observation_dim, action_dim=action_dim_val).to(device)
     critic = IPPOCritic(observation_dim=observation_dim).to(device)
     optimizer = torch.optim.Adam(
         list(actor.parameters()) + list(critic.parameters()),
         lr=train_config.learning_rate,
         eps=1e-5,
     )
-    batch_size = train_config.num_envs * NUM_AGENTS
+    batch_size = train_config.num_envs * num_agents
     rollout_batch_size = train_config.rollout_length * batch_size
     minibatch_size = min(train_config.minibatch_size, rollout_batch_size)
     updates = max(ceil(train_config.total_timesteps / rollout_batch_size), 1)
@@ -130,7 +130,9 @@ def train_ippo(
             (train_config.rollout_length, batch_size, observation_dim), device=device
         )
         mask_buf = torch.zeros(
-            (train_config.rollout_length, batch_size, ACTION_DIM), dtype=torch.bool, device=device
+            (train_config.rollout_length, batch_size, action_dim_val),
+            dtype=torch.bool,
+            device=device,
         )
         action_buf = torch.zeros(
             (train_config.rollout_length, batch_size), dtype=torch.long, device=device
@@ -173,13 +175,13 @@ def train_ippo(
             env_actions = _unflatten_actions(actions.cpu().numpy(), envs)
             next_observations: list[dict[str, np.ndarray]] = []
             next_infos: list[dict[str, dict[str, Any]]] = []
-            done_flags = np.zeros((train_config.num_envs, NUM_AGENTS), dtype=np.float32)
+            done_flags = np.zeros((train_config.num_envs, num_agents), dtype=np.float32)
 
             for env_id, env in enumerate(envs):
                 obs, rewards, terminations, truncations, info = env.step(env_actions[env_id])
                 done = all(terminations.values()) or all(truncations.values())
                 reward_values = [rewards[agent] for agent in env.possible_agents]
-                reward_buf[step, env_id * NUM_AGENTS : (env_id + 1) * NUM_AGENTS] = torch.tensor(
+                reward_buf[step, env_id * num_agents : (env_id + 1) * num_agents] = torch.tensor(
                     reward_values,
                     dtype=torch.float32,
                     device=device,
@@ -192,8 +194,8 @@ def train_ippo(
                     episode_satisfaction.append(float(outcome["demand_satisfaction_rate"]))
                     obs, info = env.reset(seed=current_seed)
                     current_seed += 1
-                    next_actor_hidden[env_id * NUM_AGENTS : (env_id + 1) * NUM_AGENTS] = 0.0
-                    next_critic_hidden[env_id * NUM_AGENTS : (env_id + 1) * NUM_AGENTS] = 0.0
+                    next_actor_hidden[env_id * num_agents : (env_id + 1) * num_agents] = 0.0
+                    next_critic_hidden[env_id * num_agents : (env_id + 1) * num_agents] = 0.0
                 next_observations.append(obs)
                 next_infos.append(info)
 
@@ -220,7 +222,7 @@ def train_ippo(
             returns = advantages + value_buf
 
         flat_obs = obs_buf.reshape((-1, observation_dim))
-        flat_masks = mask_buf.reshape((-1, ACTION_DIM))
+        flat_masks = mask_buf.reshape((-1, action_dim_val))
         flat_actions = action_buf.reshape(-1)
         flat_logprobs = logprob_buf.reshape(-1)
         flat_advantages = advantages.reshape(-1)
@@ -329,10 +331,13 @@ def evaluate_checkpoint(
     torch_device = torch.device(device)
     checkpoint = torch.load(checkpoint_path, map_location=torch_device, weights_only=False)
     env_observation_dim = env_config.observation_dim
-    actor = IPPOActor(observation_dim=env_observation_dim).to(torch_device)
+    actor = IPPOActor(observation_dim=env_observation_dim, action_dim=env_config.action_dim).to(
+        torch_device
+    )
     actor.load_state_dict(checkpoint["actor"])
     actor.eval()
 
+    num_agents = env_config.num_agents
     satisfaction_rates: list[float] = []
     rewards: list[float] = []
     for episode in range(episodes):
@@ -342,7 +347,7 @@ def evaluate_checkpoint(
         episode_config = replace(env_config, replay_path=replay_path)
         env = ResourceLogisticsEnv(config=episode_config, seed=seed + episode)
         observations, infos = env.reset(seed=seed + episode)
-        hidden = actor.initial_hidden(NUM_AGENTS, torch_device)
+        hidden = actor.initial_hidden(num_agents, torch_device)
         done = False
         while not done:
             obs_tensor = _stack_single_env_observations(observations, env, torch_device)
@@ -421,9 +426,9 @@ def _stack_observations(
     device: torch.device,
 ) -> torch.Tensor:
     arrays = [
-        env_observations[f"agent_{agent_id}"]
+        env_observations[agent]
         for env_observations in observations
-        for agent_id in range(NUM_AGENTS)
+        for agent in sorted(env_observations.keys())
     ]
     return torch.as_tensor(np.stack(arrays), dtype=torch.float32, device=device)
 
@@ -433,9 +438,7 @@ def _stack_action_masks(
     device: torch.device,
 ) -> torch.Tensor:
     arrays = [
-        env_infos[f"agent_{agent_id}"]["action_mask"]
-        for env_infos in infos
-        for agent_id in range(NUM_AGENTS)
+        env_infos[agent]["action_mask"] for env_infos in infos for agent in sorted(env_infos.keys())
     ]
     return torch.as_tensor(np.stack(arrays), dtype=torch.bool, device=device)
 

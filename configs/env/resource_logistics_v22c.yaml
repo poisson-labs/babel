@@ -1,0 +1,27 @@
+num_nodes: 24
+num_agents: 4
+num_resource_types: 2
+episode_length: 50
+inventory_capacity: 2
+initial_demands_min: 3
+initial_demands_max: 6
+deadline_min: 35
+deadline_max: 45
+reward_values: [1, 2, 3]
+depot_inventory_min: 1
+depot_inventory_max: 2
+replenishment_rate: 0.1
+max_demands: 8
+message_dim: 14
+message_history_length: 5
+private_demands: false
+discovery_reward: 0.0
+role_asymmetry: true
+semantic_channel: false
+replay_path: null
+# V22c: 24-node anti-sweep geometry + 2 resource types (halved semantic search space)
+# Fuel=30 forces routing through the communication bottleneck
+num_depots: 4
+num_demand_nodes: 14
+num_transit_hubs: 6
+fuel_budget: 30

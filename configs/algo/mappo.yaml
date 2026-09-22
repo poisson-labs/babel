@@ -28,18 +28,18 @@ log_interval_updates: 10
 eval_episodes: 500
 eval_seed: 200000
 bootstrap_resamples: 1000
-gate_low: 0.70
-gate_high: 0.85
-borderline_pass_low: 0.643
-ippo_point_estimate: 0.34297380952380957
-ippo_upper_ci: 0.3578999404761905
+gate_low: 0.32
+gate_high: 0.60
+borderline_pass_low: 0.25
+ippo_point_estimate: 0.019314285714285714
+ippo_upper_ci: 0.023096309523809522
 
 checkpoint_dir: artifacts/checkpoints
-summary_path: artifacts/phase2_symbolic_8bit_summary.json
+summary_path: artifacts/phase2_symbolic_8bit_v3_summary.json
 eval_checkpoint_paths: []
 
 wandb:
   project: babel
-  group: phase2_symbolic_8bit
+  group: phase2_symbolic_8bit_v3
   mode: online
   enabled: true

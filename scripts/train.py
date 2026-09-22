@@ -124,7 +124,8 @@ def _run_ippo(cfg: DictConfig, env_config: ResourceLogisticsConfig) -> None:
 
 
 def _run_mappo_symbolic(cfg: DictConfig, env_config: ResourceLogisticsConfig) -> None:
-    channel_config = _symbolic_channel_config_from_cfg(cfg.channel)
+    channel_type = cfg.channel.get("channel_type", "symbolic")
+    channel_config = dict(cfg.channel)
     checkpoint_paths: list[Path] = []
     train_results: list[dict[str, Any]] = []
 
@@ -134,6 +135,7 @@ def _run_mappo_symbolic(cfg: DictConfig, env_config: ResourceLogisticsConfig) ->
             result = train_mappo_symbolic(
                 env_config=env_config,
                 train_config=train_config,
+                channel_type=channel_type,
                 channel_config=channel_config,
             )
             checkpoint_paths.append(result.checkpoint_path)
@@ -186,6 +188,9 @@ def _run_mappo_symbolic(cfg: DictConfig, env_config: ResourceLogisticsConfig) ->
             resamples=int(cfg.bootstrap_resamples),
             ippo_point_estimate=float(cfg.ippo_point_estimate),
             ippo_upper_ci=float(cfg.ippo_upper_ci),
+            gate_low=float(cfg.gate_low),
+            gate_high=float(cfg.gate_high),
+            borderline_pass_low=float(cfg.borderline_pass_low),
         )
         summary["gate"] = {
             **asdict(gate.ci),
@@ -243,6 +248,7 @@ def _env_config_from_cfg(cfg: DictConfig) -> ResourceLogisticsConfig:
     return ResourceLogisticsConfig(
         num_nodes=int(data["num_nodes"]),
         num_agents=int(data["num_agents"]),
+        num_resource_types=int(data.get("num_resource_types", 2)),
         episode_length=int(data["episode_length"]),
         inventory_capacity=int(data["inventory_capacity"]),
         initial_demands_min=int(data["initial_demands_min"]),
@@ -256,7 +262,16 @@ def _env_config_from_cfg(cfg: DictConfig) -> ResourceLogisticsConfig:
         max_demands=int(data["max_demands"]),
         message_dim=int(data.get("message_dim", 0)),
         message_history_length=int(data.get("message_history_length", 5)),
+        private_demands=bool(data.get("private_demands", False)),
+        discovery_reward=float(data.get("discovery_reward", 0.1)),
+        role_asymmetry=bool(data.get("role_asymmetry", False)),
+        semantic_channel=bool(data.get("semantic_channel", False)),
         replay_path=data["replay_path"],
+        # V22 additions
+        num_depots=int(data.get("num_depots", 3)),
+        num_demand_nodes=int(data.get("num_demand_nodes", 6)),
+        num_transit_hubs=int(data.get("num_transit_hubs", 3)),
+        fuel_budget=int(data["fuel_budget"]) if data.get("fuel_budget") is not None else None,
     )
 
 
@@ -287,12 +302,15 @@ def _train_config_from_cfg(cfg: DictConfig, seed: int) -> IPPOTrainConfig:
 
 
 def _symbolic_channel_config_from_cfg(cfg: DictConfig) -> SymbolicChannelConfig:
+    slot_sizes_raw = cfg.get("channel_slot_sizes", None)
+    slot_sizes = tuple(int(s) for s in slot_sizes_raw) if slot_sizes_raw else (8, 16, 2)
     return SymbolicChannelConfig(
-        message_dim=int(cfg.message_dim),
-        hidden_dim=int(cfg.hidden_dim),
-        initial_temperature=float(cfg.initial_temperature),
-        min_temperature=float(cfg.min_temperature),
-        anneal_steps=int(cfg.anneal_steps),
+        message_dim=int(cfg.channel.message_dim),
+        hidden_dim=int(cfg.channel.hidden_dim),
+        initial_temperature=float(cfg.channel.initial_temperature),
+        min_temperature=float(cfg.channel.min_temperature),
+        anneal_steps=int(cfg.channel.anneal_steps),
+        slot_sizes=slot_sizes,
     )
 
 
@@ -314,12 +332,15 @@ def _mappo_train_config_from_cfg(cfg: DictConfig, seed: int) -> MAPPOTrainConfig
         seed=seed,
         device=str(cfg.device),
         checkpoint_dir=Path(to_absolute_path(str(cfg.checkpoint_dir))),
-        checkpoint_name=f"mappo_symbolic_seed_{seed}.pt",
+        checkpoint_name=str(cfg.checkpoint_name)
+        if cfg.get("checkpoint_name")
+        else f"mappo_symbolic_seed_{seed}.pt",
         wandb_project=str(cfg.wandb.project),
         wandb_group=str(cfg.wandb.group),
         wandb_mode=str(cfg.wandb.mode),
         track_wandb=bool(cfg.wandb.enabled),
         log_interval_updates=int(cfg.log_interval_updates),
+        load_checkpoint=str(cfg.load_checkpoint) if cfg.get("load_checkpoint") else None,
     )
 
 

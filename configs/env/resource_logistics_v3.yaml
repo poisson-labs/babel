@@ -1,0 +1,15 @@
+num_nodes: 12
+num_agents: 4
+episode_length: 50
+inventory_capacity: 2
+initial_demands_min: 5
+initial_demands_max: 8
+# V3 Role Asymmetry: Gatherers and Deliverers. Deadlines are relaxed to allow handoffs.
+deadline_min: 12
+deadline_max: 20
+reward_values: [1, 2, 3]
+depot_inventory_min: 3
+depot_inventory_max: 5
+replenishment_rate: 0.1
+max_demands: 8
+replay_path: null

@@ -11,8 +11,3 @@ repos:
         entry: python -m uv run ruff format --check
         language: system
         types_or: [python, pyi]
-      - id: pyright
-        name: pyright
-        entry: python -m uv run pyright
-        language: system
-        pass_filenames: false

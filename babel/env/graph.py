@@ -32,6 +32,10 @@ class ResourceGraph:
     node_types: tuple[str, ...]
     edges: tuple[GraphEdge, ...]
 
+    @property
+    def num_nodes(self) -> int:
+        return len(self.positions)
+
     def neighbors(self, node_id: int) -> tuple[int, ...]:
         return tuple(
             edge.target if edge.source == node_id else edge.source
@@ -67,8 +71,9 @@ class ResourceGraph:
         return distances
 
     def shortest_costs(self, start: int) -> dict[int, int]:
+        n = self.num_nodes
         costs: dict[int, int] = {start: 0}
-        pending = set(range(NUM_NODES))
+        pending = set(range(n))
         while pending:
             current = min(pending, key=lambda node_id: costs.get(node_id, 10**9))
             if current not in costs:
@@ -96,12 +101,36 @@ class ResourceGraph:
         }
 
 
-def generate_resource_graph(seed: int, *, max_attempts: int = 10_000) -> ResourceGraph:
+def generate_resource_graph(
+    seed: int,
+    *,
+    num_nodes: int = NUM_NODES,
+    num_depots: int = 3,
+    num_demand_nodes: int = 6,
+    num_transit_hubs: int = 3,
+    max_attempts: int = 10_000,
+) -> ResourceGraph:
+    """Generate a resource logistics graph.
+
+    Args:
+        seed: Random seed for reproducibility.
+        num_nodes: Total number of nodes (must equal sum of type counts).
+        num_depots: Number of depot nodes.
+        num_demand_nodes: Number of demand nodes.
+        num_transit_hubs: Number of transit hub nodes.
+        max_attempts: Maximum generation attempts before raising.
+    """
+    if num_depots + num_demand_nodes + num_transit_hubs != num_nodes:
+        raise ValueError(
+            f"Node type counts ({num_depots}+{num_demand_nodes}+{num_transit_hubs}="
+            f"{num_depots + num_demand_nodes + num_transit_hubs}) "
+            f"must equal num_nodes ({num_nodes})"
+        )
     rng = np.random.default_rng(seed)
     for _ in range(max_attempts):
-        positions_array = rng.random((NUM_NODES, 2))
-        node_types = _sample_node_types(rng)
-        undirected_edges = _build_degree_bounded_edges(positions_array)
+        positions_array = rng.random((num_nodes, 2))
+        node_types = _sample_node_types(rng, num_depots, num_demand_nodes, num_transit_hubs)
+        undirected_edges = _build_degree_bounded_edges(positions_array, num_nodes)
         if undirected_edges is None:
             continue
 
@@ -120,43 +149,54 @@ def generate_resource_graph(seed: int, *, max_attempts: int = 10_000) -> Resourc
     raise RuntimeError(f"Could not generate a valid Resource Logistics graph for seed {seed}")
 
 
-def _sample_node_types(rng: np.random.Generator) -> tuple[str, ...]:
-    labels = np.array([DEPOT] * 3 + [DEMAND] * 6 + [TRANSIT] * 3, dtype=object)
+def _sample_node_types(
+    rng: np.random.Generator,
+    num_depots: int = 3,
+    num_demand_nodes: int = 6,
+    num_transit_hubs: int = 3,
+) -> tuple[str, ...]:
+    labels = np.array(
+        [DEPOT] * num_depots + [DEMAND] * num_demand_nodes + [TRANSIT] * num_transit_hubs,
+        dtype=object,
+    )
     rng.shuffle(labels)
     return tuple(str(label) for label in labels.tolist())
 
 
 def _build_degree_bounded_edges(
     positions: NDArray[np.float64],
+    num_nodes: int,
 ) -> set[tuple[int, int]] | None:
-    candidates = _candidate_edges_by_distance(positions)
+    candidates = _candidate_edges_by_distance(positions, num_nodes)
     edges: set[tuple[int, int]] = set()
-    degrees = [0 for _ in range(NUM_NODES)]
+    degrees = [0 for _ in range(num_nodes)]
 
     while min(degrees) < 2:
-        node_id = min(range(NUM_NODES), key=lambda candidate: degrees[candidate])
+        node_id = min(range(num_nodes), key=lambda candidate: degrees[candidate])
         edge = _shortest_available_edge(node_id, candidates, degrees, edges)
         if edge is None:
             return None
         _add_edge(edge, edges, degrees)
 
     for edge in candidates:
-        if _is_connected(edges) and max(degrees) <= 4:
+        if _is_connected(edges, num_nodes) and max(degrees) <= 4:
             break
         if edge not in edges and degrees[edge[0]] < 4 and degrees[edge[1]] < 4:
             _add_edge(edge, edges, degrees)
 
-    if not _is_connected(edges):
+    if not _is_connected(edges, num_nodes):
         return None
     if not all(2 <= degree <= 4 for degree in degrees):
         return None
     return edges
 
 
-def _candidate_edges_by_distance(positions: NDArray[np.float64]) -> list[tuple[int, int]]:
+def _candidate_edges_by_distance(
+    positions: NDArray[np.float64], num_nodes: int
+) -> list[tuple[int, int]]:
     candidates: list[tuple[float, int, int]] = []
-    for source in range(NUM_NODES):
-        for target in range(source + 1, NUM_NODES):
+    for source in range(num_nodes):
+        for target in range(source + 1, num_nodes):
             distance = hypot(
                 float(positions[source, 0] - positions[target, 0]),
                 float(positions[source, 1] - positions[target, 1]),
@@ -189,8 +229,8 @@ def _add_edge(edge: tuple[int, int], edges: set[tuple[int, int]], degrees: list[
     degrees[target] += 1
 
 
-def _is_connected(edges: set[tuple[int, int]]) -> bool:
-    adjacency: dict[int, list[int]] = {node_id: [] for node_id in range(NUM_NODES)}
+def _is_connected(edges: set[tuple[int, int]], num_nodes: int) -> bool:
+    adjacency: dict[int, list[int]] = {node_id: [] for node_id in range(num_nodes)}
     for source, target in edges:
         adjacency[source].append(target)
         adjacency[target].append(source)
@@ -202,4 +242,4 @@ def _is_connected(edges: set[tuple[int, int]]) -> bool:
             if neighbor not in seen:
                 seen.add(neighbor)
                 queue.append(neighbor)
-    return len(seen) == NUM_NODES
+    return len(seen) == num_nodes

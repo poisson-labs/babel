@@ -1,0 +1,48 @@
+# @package _global_
+
+defaults:
+  - /env: resource_logistics_v12
+  - /channel: symbolic_8bit
+  - _self_
+
+algorithm: mappo_symbolic
+mode: train_eval
+seeds: [0]
+device: cpu
+
+# MAPPO on V12 Scout/Deliverer
+total_timesteps: 7000000
+num_envs: 16
+rollout_length: 128
+ppo_epochs: 4
+minibatch_size: 1024
+learning_rate: 0.0003
+channel_learning_rate: 0.0001
+clip_coef: 0.2
+gae_lambda: 0.95
+gamma: 0.99
+entropy_coef: 0.01
+value_coef: 0.5
+max_grad_norm: 0.5
+log_interval_updates: 10
+
+eval_episodes: 500
+eval_seed: 900000
+bootstrap_resamples: 1000
+gate_low: 0.55
+gate_high: 0.85
+borderline_pass_low: 0.50
+ippo_point_estimate: 0.166
+ippo_upper_ci: 0.180
+
+checkpoint_dir: artifacts/checkpoints
+checkpoint_name: "mappo_v12_seed_0.pt"
+summary_path: artifacts/phase2_symbolic_8bit_v12_summary.json
+eval_checkpoint_paths: []
+load_checkpoint: null
+
+wandb:
+  project: babel
+  group: phase2_symbolic_8bit_v12
+  mode: online
+  enabled: true

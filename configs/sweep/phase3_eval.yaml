@@ -1,0 +1,13 @@
+# Phase 3 Evaluation Sweep
+
+eval_episodes: 500
+eval_seed: 900000
+
+# We include the "stealth" 5% whisper attack
+p_adv_sweep:
+  - 0.0
+  - 0.05
+  - 0.10
+  - 0.25
+  - 0.50
+  - 1.0

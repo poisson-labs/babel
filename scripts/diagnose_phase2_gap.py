@@ -250,8 +250,8 @@ def run_diagnostics() -> dict[str, Any]:
             "symbolic_eval_seed": SYMBOLIC_EVAL_SEED,
             "ippo_eval_seed": IPPO_EVAL_SEED,
             "solo_env_seed": SOLO_ENV_SEED,
-            "gate2_gap_vs_ippo_point_pp": 12.7,
-            "gate2_gap_vs_ippo_upper_ci_pp": 11.2,
+            "gate2_gap_vs_ippo_point_pp": 2.9,
+            "gate2_gap_vs_ippo_upper_ci_pp": 1.6,
         },
         "channel_utilization": {
             "by_seed": [run["channel"] for run in symbolic_runs],
@@ -281,6 +281,10 @@ def evaluate_symbolic(
     env_config = ResourceLogisticsConfig(
         message_dim=channel_config.message_dim,
         message_history_length=5,
+        deadline_min=12,
+        deadline_max=20,
+        depot_inventory_min=3,
+        depot_inventory_max=5,
     )
     actor = MAPPOActor(
         observation_dim=env_config.observation_dim,
@@ -342,7 +346,12 @@ def evaluate_ippo(
     episodes: int,
     seed: int,
 ) -> dict[str, Any]:
-    env_config = ResourceLogisticsConfig()
+    env_config = ResourceLogisticsConfig(
+        deadline_min=12,
+        deadline_max=20,
+        depot_inventory_min=3,
+        depot_inventory_max=5,
+    )
     checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
     actor = IPPOActor(observation_dim=env_config.observation_dim).to(DEVICE)
     actor.load_state_dict(checkpoint["actor"])
@@ -377,7 +386,12 @@ def evaluate_ippo(
 
 
 def analyze_solo_completability(*, episodes: int, seed: int) -> dict[str, Any]:
-    config = ResourceLogisticsConfig()
+    config = ResourceLogisticsConfig(
+        deadline_min=12,
+        deadline_max=20,
+        depot_inventory_min=3,
+        depot_inventory_max=5,
+    )
     total = 0
     completable = 0
     travel_costs: list[int] = []

@@ -105,6 +105,7 @@ class SymbolicChannel(nn.Module, ChannelModule[SymbolicMessage]):
         initial_temperature: float = 1.0,
         min_temperature: float = 0.2,
         anneal_steps: int = 1_000_000,
+        slot_sizes: tuple[int, ...] = SYMBOLIC_SLOT_SIZES,
     ) -> None:
         super().__init__()
         self.agent_intent_dim = agent_intent_dim
@@ -114,6 +115,19 @@ class SymbolicChannel(nn.Module, ChannelModule[SymbolicMessage]):
         self.min_temperature = min_temperature
         self.anneal_steps = max(anneal_steps, 1)
         self.temperature = initial_temperature
+        self.slot_sizes = slot_sizes
+
+        # Compute capacity bits from slot sizes: sum of log2(each slot size)
+        import math
+
+        self._capacity_bits = sum(math.log2(s) for s in slot_sizes)
+        # Compute multipliers for code packing (big-endian)
+        self._slot_multipliers: list[int] = []
+        mult = 1
+        for s in reversed(slot_sizes):
+            self._slot_multipliers.insert(0, mult)
+            mult *= s
+        self._total_codes = mult
 
         input_dim = agent_intent_dim + observation_dim
         self.sender = nn.Sequential(
@@ -122,10 +136,8 @@ class SymbolicChannel(nn.Module, ChannelModule[SymbolicMessage]):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
-        self.claim_head = nn.Linear(hidden_dim, SYMBOLIC_SLOT_SIZES[0])
-        self.node_head = nn.Linear(hidden_dim, SYMBOLIC_SLOT_SIZES[1])
-        self.payload_head = nn.Linear(hidden_dim, SYMBOLIC_SLOT_SIZES[2])
-        self.decoder = nn.Embedding(2**SYMBOLIC_CAPACITY_BITS, message_dim)
+        self.slot_heads = nn.ModuleList([nn.Linear(hidden_dim, size) for size in slot_sizes])
+        self.decoder = nn.Embedding(self._total_codes, message_dim)
 
     def encode(self, agent_intent: Tensor, obs: Tensor, agent_id: int) -> SymbolicMessage:
         del agent_id
@@ -209,7 +221,7 @@ class SymbolicChannel(nn.Module, ChannelModule[SymbolicMessage]):
         )
 
     def capacity_bits(self) -> float:
-        return float(SYMBOLIC_CAPACITY_BITS)
+        return self._capacity_bits
 
     def anneal_temperature(self, step: int) -> float:
         fraction = min(max(step / self.anneal_steps, 0.0), 1.0)
@@ -223,19 +235,18 @@ class SymbolicChannel(nn.Module, ChannelModule[SymbolicMessage]):
 
     def slots_to_codes(self, slots: Tensor) -> Tensor:
         slots = slots.long()
-        return slots[:, 0] * 32 + slots[:, 1] * 2 + slots[:, 2]
+        code = _torch.zeros(slots.shape[0], dtype=_torch.long, device=slots.device)
+        for i, mult in enumerate(self._slot_multipliers):
+            code = code + slots[:, i] * mult
+        return code
 
     def _slot_logits(
         self,
         agent_intents: Tensor,
         observations: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, ...]:
         features = self.sender(_torch.cat([agent_intents, observations], dim=-1))
-        return (
-            self.claim_head(features),
-            self.node_head(features),
-            self.payload_head(features),
-        )
+        return tuple(head(features) for head in self.slot_heads)
 
 
 def _bits(value: int, width: int) -> tuple[int, ...]:

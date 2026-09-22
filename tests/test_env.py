@@ -3,11 +3,7 @@ from __future__ import annotations
 import msgpack
 import numpy as np
 from babel.env.dynamics import (
-    ACTION_DIM,
-    GLOBAL_STATE_DIM,
-    MESSAGE_HISTORY_OFFSET,
     NUM_AGENTS,
-    OBSERVATION_DIM,
     ResourceLogisticsConfig,
     ResourceLogisticsEnv,
 )
@@ -40,17 +36,17 @@ def test_env_reset_step_and_action_masks_are_well_formed() -> None:
 
     assert len(observations) == NUM_AGENTS
     assert set(observations) == set(env.agents)
-    assert all(obs.shape == (OBSERVATION_DIM,) for obs in observations.values())
+    assert all(obs.shape == (env.config.observation_dim,) for obs in observations.values())
     assert all(np.isfinite(obs).all() for obs in observations.values())
     assert all("action_mask" in info for info in infos.values())
 
     global_state = env.global_state_features()
-    assert global_state.shape == (GLOBAL_STATE_DIM,)
+    assert global_state.shape == (env.config.global_state_dim,)
     assert np.isfinite(global_state).all()
 
     action_masks = env.action_masks()
     for agent_id, mask in action_masks.items():
-        assert mask.shape == (ACTION_DIM,)
+        assert mask.shape == (env.config.action_dim,)
         assert mask.dtype == np.bool_
         assert mask[env.noop_action]
         assert np.any(mask)
@@ -60,7 +56,7 @@ def test_env_reset_step_and_action_masks_are_well_formed() -> None:
     next_obs, rewards, terminations, truncations, next_infos = env.step(actions)
 
     assert set(next_obs) == set(env.agents)
-    assert all(obs.shape == (OBSERVATION_DIM,) for obs in next_obs.values())
+    assert all(obs.shape == (env.config.observation_dim,) for obs in next_obs.values())
     assert len(set(rewards.values())) == 1
     assert all(isinstance(done, bool) for done in terminations.values())
     assert all(isinstance(done, bool) for done in truncations.values())
@@ -106,12 +102,12 @@ def test_replay_round_trip_records_exhaustive_episode(tmp_path) -> None:
 def test_message_history_component_is_zero_until_messages_arrive() -> None:
     env = ResourceLogisticsEnv(ResourceLogisticsConfig(message_dim=16), seed=222)
     observations, _ = env.reset(seed=222)
-    message_end = MESSAGE_HISTORY_OFFSET + env.config.message_history_length * 3 * 16
+    message_history_offset = env.config.message_history_offset
+    message_end = message_history_offset + env.config.message_history_length * 3 * 16
 
-    assert env.config.observation_dim == OBSERVATION_DIM + 5 * 3 * 16
     assert all(obs.shape == (env.config.observation_dim,) for obs in observations.values())
     assert all(
-        np.allclose(obs[MESSAGE_HISTORY_OFFSET:message_end], 0.0) for obs in observations.values()
+        np.allclose(obs[message_history_offset:message_end], 0.0) for obs in observations.values()
     )
 
     sender = env.possible_agents[0]
@@ -125,6 +121,6 @@ def test_message_history_component_is_zero_until_messages_arrive() -> None:
     }
 
     next_observations, _, _, _, _ = env.step(actions)
-    receiver_history = next_observations[receiver][MESSAGE_HISTORY_OFFSET:message_end]
+    receiver_history = next_observations[receiver][message_history_offset:message_end]
 
     assert np.count_nonzero(receiver_history) == 16

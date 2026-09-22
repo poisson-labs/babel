@@ -61,3 +61,81 @@ def test_symbolic_batch_sample_outputs_embeddings_and_logprobs() -> None:
     assert torch.all((batch.slots[:, 0] >= 0) & (batch.slots[:, 0] < 8))
     assert torch.all((batch.slots[:, 1] >= 0) & (batch.slots[:, 1] < 16))
     assert torch.all((batch.slots[:, 2] >= 0) & (batch.slots[:, 2] < 2))
+
+
+def test_latent_vq_channel_passes_sanity() -> None:
+    from babel.channels.latent_vq import LatentVQChannel, VQMessage
+
+    torch.manual_seed(42)
+    channel = LatentVQChannel(
+        agent_intent_dim=128,
+        observation_dim=313,
+        message_dim=16,
+        hidden_dim=128,
+        latent_dim=64,
+        codebook_size=1024,
+    )
+
+    agent_intent = torch.randn(128)
+    obs = torch.randn(313)
+
+    # Test encode
+    message = channel.encode(agent_intent, obs, agent_id=0)
+    assert isinstance(message, VQMessage)
+    assert 0 <= message.code < 1024
+    assert message.embedding.shape == (64,)
+
+    # Test decode
+    receiver_obs = torch.randn(313)
+    decoded = channel.decode(message, receiver_obs)
+    assert decoded.shape == (16,)
+
+    # Test sample_batch
+    agent_intents = torch.randn(6, 128)
+    observations = torch.randn(6, 313)
+    batch = channel.sample_batch(agent_intents, observations)
+    assert batch.slots.shape == (6, 1)
+    assert batch.embeddings.shape == (6, 16)
+    assert batch.logprobs.shape == (6,)
+    assert batch.entropy.shape == (6,)
+    assert channel.get_loss().shape == ()
+
+
+def test_nl_channel_passes_sanity() -> None:
+    from babel.channels.nl import NLChannel, NLMessage
+
+    torch.manual_seed(42)
+    # Use gpt2 as lightweight local model
+    channel = NLChannel(
+        agent_intent_dim=128,
+        observation_dim=313,
+        message_dim=16,
+        hidden_dim=128,
+        model_name="gpt2",
+        num_soft_tokens=4,
+        max_new_tokens=4,
+    )
+
+    agent_intent = torch.randn(128)
+    obs = torch.randn(313)
+
+    # Test encode
+    message = channel.encode(agent_intent, obs, agent_id=0)
+    assert isinstance(message, NLMessage)
+    assert isinstance(message.text, str)
+    assert message.embedding.shape == (16,)
+
+    # Test decode
+    receiver_obs = torch.randn(313)
+    decoded = channel.decode(message, receiver_obs)
+    assert decoded.shape == (16,)
+    assert torch.allclose(decoded, message.embedding)
+
+    # Test sample_batch
+    agent_intents = torch.randn(6, 128)
+    observations = torch.randn(6, 313)
+    batch = channel.sample_batch(agent_intents, observations)
+    assert batch.slots.shape == (6, 1)
+    assert batch.embeddings.shape == (6, 16)
+    assert batch.logprobs.shape == (6,)
+    assert batch.entropy.shape == (6,)

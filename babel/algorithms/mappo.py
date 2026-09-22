@@ -7,7 +7,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from math import ceil
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from babel.attacks.base import CommsAttack
 
 import numpy as np
 import torch
@@ -15,7 +18,6 @@ from torch import Tensor, nn
 from torch.distributions import Categorical
 
 from babel.algorithms.ippo import BootstrapCI, EvaluationResult, bootstrap_success_ci
-from babel.channels.symbolic import SymbolicChannel
 from babel.env.dynamics import (
     ACTION_DIM,
     BASE_OBSERVATION_DIM,
@@ -27,6 +29,60 @@ from babel.env.dynamics import (
 )
 from babel.networks.encoders import ObservationEncoder
 
+
+def create_channel(
+    channel_type: str,
+    agent_intent_dim: int,
+    observation_dim: int,
+    channel_config: dict[str, Any],
+) -> nn.Module:
+    if channel_type == "symbolic":
+        from babel.channels.symbolic import SymbolicChannel
+
+        slot_sizes_raw = (
+            channel_config.get("slot_sizes")
+            or channel_config.get("channel_slot_sizes")
+            or (8, 16, 2)
+        )
+        slot_sizes = tuple(int(s) for s in slot_sizes_raw)
+        return SymbolicChannel(
+            agent_intent_dim=agent_intent_dim,
+            observation_dim=observation_dim,
+            message_dim=int(channel_config.get("message_dim", 16)),
+            hidden_dim=int(channel_config.get("hidden_dim", 128)),
+            initial_temperature=float(channel_config.get("initial_temperature", 1.0)),
+            min_temperature=float(channel_config.get("min_temperature", 0.2)),
+            anneal_steps=int(channel_config.get("anneal_steps", 1000000)),
+            slot_sizes=slot_sizes,
+        )
+    elif channel_type == "latent":
+        from babel.channels.latent_vq import LatentVQChannel
+
+        return LatentVQChannel(
+            agent_intent_dim=agent_intent_dim,
+            observation_dim=observation_dim,
+            message_dim=int(channel_config.get("message_dim", 16)),
+            hidden_dim=int(channel_config.get("hidden_dim", 128)),
+            latent_dim=int(channel_config.get("latent_dim", 64)),
+            codebook_size=int(channel_config.get("codebook_size", 1024)),
+            commitment_cost=float(channel_config.get("commitment_cost", 0.25)),
+        )
+    elif channel_type == "nl":
+        from babel.channels.nl import NLChannel
+
+        return NLChannel(
+            agent_intent_dim=agent_intent_dim,
+            observation_dim=observation_dim,
+            message_dim=int(channel_config.get("message_dim", 16)),
+            hidden_dim=int(channel_config.get("hidden_dim", 128)),
+            model_name=str(channel_config.get("model_name", "gpt2")),
+            num_soft_tokens=int(channel_config.get("num_soft_tokens", 8)),
+            max_new_tokens=int(channel_config.get("max_new_tokens", 16)),
+        )
+    else:
+        raise ValueError(f"Unknown channel_type: {channel_type}")
+
+
 _torch = cast(Any, torch)
 
 
@@ -37,6 +93,7 @@ class SymbolicChannelConfig:
     initial_temperature: float = 1.0
     min_temperature: float = 0.2
     anneal_steps: int = 1_000_000
+    slot_sizes: tuple[int, ...] = (8, 16, 2)
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +120,7 @@ class MAPPOTrainConfig:
     wandb_mode: str = "online"
     track_wandb: bool = True
     log_interval_updates: int = 10
+    load_checkpoint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,10 +143,20 @@ class Gate2Result:
 
 
 class MessageAggregator(nn.Module):
-    def __init__(self, *, message_dim: int, query_dim: int = 128, context_dim: int = 64) -> None:
+    def __init__(
+        self,
+        *,
+        message_dim: int,
+        base_observation_dim: int,
+        message_history_offset: int,
+        query_dim: int = 128,
+        context_dim: int = 64,
+    ) -> None:
         super().__init__()
         self.message_dim = message_dim
         self.context_dim = context_dim
+        self._base_observation_dim = base_observation_dim
+        self._message_history_offset = message_history_offset
         if message_dim > 0:
             self.query = nn.Linear(query_dim, context_dim)
             self.key = nn.Linear(message_dim, context_dim)
@@ -105,8 +173,8 @@ class MessageAggregator(nn.Module):
                 dtype=hidden.dtype,
                 device=hidden.device,
             )
-        history_width = observations.shape[1] - BASE_OBSERVATION_DIM
-        history_start = MESSAGE_HISTORY_OFFSET
+        history_width = observations.shape[1] - self._base_observation_dim
+        history_start = self._message_history_offset
         history_stop = history_start + history_width
         history = observations[:, history_start:history_stop]
         messages = history.reshape(hidden.shape[0], -1, self.message_dim)
@@ -130,16 +198,22 @@ class MAPPOActor(nn.Module):
         message_dim: int,
         action_dim: int = ACTION_DIM,
         hidden_dim: int = 128,
+        base_observation_dim: int = BASE_OBSERVATION_DIM,
+        message_history_offset: int = MESSAGE_HISTORY_OFFSET,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
+        self._base_observation_dim = base_observation_dim
+        self._message_history_offset = message_history_offset
         self.encoder = ObservationEncoder(
-            observation_dim=BASE_OBSERVATION_DIM,
+            observation_dim=base_observation_dim,
             hidden_dim=hidden_dim,
         )
         self.gru = nn.GRUCell(hidden_dim, hidden_dim)
         self.message_aggregator = MessageAggregator(
             message_dim=message_dim,
+            base_observation_dim=base_observation_dim,
+            message_history_offset=message_history_offset,
             query_dim=hidden_dim,
             context_dim=64,
         )
@@ -148,8 +222,13 @@ class MAPPOActor(nn.Module):
             nn.ReLU(),
             nn.Linear(256, action_dim),
         )
+
+        # Zero-init the message_context weights so the actor ignores the noisy channel at start.
+        with torch.no_grad():
+            self.policy_head[0].weight[:, hidden_dim:] *= 0.01
+
         self.observation_dim = observation_dim
-        self.message_history_width = observation_dim - BASE_OBSERVATION_DIM
+        self.message_history_width = observation_dim - base_observation_dim
 
     def initial_hidden(self, batch_size: int, device: object) -> Tensor:
         return cast(
@@ -174,10 +253,10 @@ class MAPPOActor(nn.Module):
 
     def _base_observations(self, observations: Tensor) -> Tensor:
         if self.message_history_width == 0:
-            return observations[:, :BASE_OBSERVATION_DIM]
-        history_stop = MESSAGE_HISTORY_OFFSET + self.message_history_width
+            return observations[:, : self._base_observation_dim]
+        history_stop = self._message_history_offset + self.message_history_width
         return _torch.cat(
-            [observations[:, :MESSAGE_HISTORY_OFFSET], observations[:, history_stop:]],
+            [observations[:, : self._message_history_offset], observations[:, history_stop:]],
             dim=-1,
         )
 
@@ -208,17 +287,23 @@ def train_mappo_symbolic(
     *,
     env_config: ResourceLogisticsConfig,
     train_config: MAPPOTrainConfig,
-    channel_config: SymbolicChannelConfig,
+    channel_type: str,
+    channel_config: dict[str, Any],
 ) -> TrainingResult:
     _set_global_seeds(train_config.seed)
     device = torch.device(train_config.device)
     env_config = replace(
         env_config,
-        message_dim=channel_config.message_dim,
+        message_dim=int(channel_config.get("message_dim", 16)),
         message_history_length=5,
         replay_path=None,
     )
     observation_dim = env_config.observation_dim
+    num_agents = env_config.num_agents
+    action_dim = env_config.action_dim
+    base_obs_dim = env_config.base_observation_dim
+    msg_hist_offset = env_config.message_history_offset
+    global_state_dim = env_config.global_state_dim
     envs = [
         ResourceLogisticsEnv(config=env_config, seed=train_config.seed + env_id)
         for env_id in range(train_config.num_envs)
@@ -233,18 +318,32 @@ def train_mappo_symbolic(
 
     actor = MAPPOActor(
         observation_dim=observation_dim,
-        message_dim=channel_config.message_dim,
+        message_dim=int(channel_config.get("message_dim", 16)),
+        action_dim=action_dim,
+        base_observation_dim=base_obs_dim,
+        message_history_offset=msg_hist_offset,
     ).to(device)
-    critic = CentralizedCritic(observation_dim=observation_dim).to(device)
-    channel = SymbolicChannel(
+    critic = CentralizedCritic(
+        observation_dim=observation_dim,
+        global_state_dim=global_state_dim,
+        num_agents=num_agents,
+    ).to(device)
+    channel = create_channel(
+        channel_type=channel_type,
         agent_intent_dim=actor.hidden_dim,
         observation_dim=observation_dim,
-        message_dim=channel_config.message_dim,
-        hidden_dim=channel_config.hidden_dim,
-        initial_temperature=channel_config.initial_temperature,
-        min_temperature=channel_config.min_temperature,
-        anneal_steps=channel_config.anneal_steps,
+        channel_config=channel_config,
     ).to(device)
+
+    if train_config.load_checkpoint:
+        print(f"Loading checkpoint from {train_config.load_checkpoint}")
+        checkpoint = torch.load(
+            train_config.load_checkpoint, map_location=device, weights_only=False
+        )
+        actor.load_state_dict(checkpoint["actor"])
+        critic.load_state_dict(checkpoint["critic"])
+        channel.load_state_dict(checkpoint["channel"])
+
     optimizer = torch.optim.Adam(
         [
             {"params": actor.parameters(), "lr": train_config.learning_rate},
@@ -253,10 +352,10 @@ def train_mappo_symbolic(
         ],
         eps=1e-5,
     )
-    batch_size = train_config.num_envs * NUM_AGENTS
+    batch_size = train_config.num_envs * num_agents
     rollout_env_batch = train_config.rollout_length * train_config.num_envs
-    central_observation_dim = NUM_AGENTS * observation_dim + GLOBAL_STATE_DIM
-    rollout_actor_batch = rollout_env_batch * NUM_AGENTS
+    central_observation_dim = num_agents * observation_dim + global_state_dim
+    rollout_actor_batch = rollout_env_batch * num_agents
     minibatch_size = min(train_config.minibatch_size, rollout_actor_batch)
     updates = max(ceil(train_config.total_timesteps / rollout_actor_batch), 1)
     actor_hidden = actor.initial_hidden(batch_size, device)
@@ -267,7 +366,7 @@ def train_mappo_symbolic(
 
     for update in range(1, updates + 1):
         obs_buf = torch.zeros(
-            (train_config.rollout_length, train_config.num_envs, NUM_AGENTS, observation_dim),
+            (train_config.rollout_length, train_config.num_envs, num_agents, observation_dim),
             device=device,
         )
         central_obs_buf = torch.zeros(
@@ -275,22 +374,23 @@ def train_mappo_symbolic(
             device=device,
         )
         mask_buf = torch.zeros(
-            (train_config.rollout_length, train_config.num_envs, NUM_AGENTS, ACTION_DIM),
+            (train_config.rollout_length, train_config.num_envs, num_agents, action_dim),
             dtype=torch.bool,
             device=device,
         )
         action_buf = torch.zeros(
-            (train_config.rollout_length, train_config.num_envs, NUM_AGENTS),
+            (train_config.rollout_length, train_config.num_envs, num_agents),
             dtype=torch.long,
             device=device,
         )
+        n_slots = len(channel.slot_sizes) if hasattr(channel, "slot_sizes") else 1
         message_slot_buf = torch.zeros(
-            (train_config.rollout_length, train_config.num_envs, NUM_AGENTS, 3),
+            (train_config.rollout_length, train_config.num_envs, num_agents, n_slots),
             dtype=torch.long,
             device=device,
         )
         logprob_buf = torch.zeros(
-            (train_config.rollout_length, train_config.num_envs, NUM_AGENTS),
+            (train_config.rollout_length, train_config.num_envs, num_agents),
             device=device,
         )
         reward_buf = torch.zeros(
@@ -300,24 +400,25 @@ def train_mappo_symbolic(
         done_buf = torch.zeros((train_config.rollout_length, train_config.num_envs), device=device)
         value_buf = torch.zeros((train_config.rollout_length, train_config.num_envs), device=device)
         hidden_buf = torch.zeros(
-            (train_config.rollout_length, train_config.num_envs, NUM_AGENTS, actor.hidden_dim),
+            (train_config.rollout_length, train_config.num_envs, num_agents, actor.hidden_dim),
             device=device,
         )
 
         for step in range(train_config.rollout_length):
-            channel.anneal_temperature(global_step)
+            if hasattr(channel, "anneal_temperature"):
+                channel.anneal_temperature(global_step)
             obs_tensor = _stack_observations(observations, device)
             flat_obs = obs_tensor.reshape(batch_size, observation_dim)
             central_obs = _central_observations(obs_tensor, envs, device)
             mask_tensor = _stack_action_masks(infos, device)
-            flat_mask = mask_tensor.reshape(batch_size, ACTION_DIM)
+            flat_mask = mask_tensor.reshape(batch_size, action_dim)
 
             obs_buf[step] = obs_tensor
             central_obs_buf[step] = central_obs
             mask_buf[step] = mask_tensor
             hidden_buf[step] = actor_hidden.reshape(
                 train_config.num_envs,
-                NUM_AGENTS,
+                num_agents,
                 actor.hidden_dim,
             )
 
@@ -334,11 +435,11 @@ def train_mappo_symbolic(
                 message_batch = channel.sample_batch(agent_intents, flat_obs)
                 combined_logprobs = action_logprobs + message_batch.logprobs
 
-            action_buf[step] = movement_actions.reshape(train_config.num_envs, NUM_AGENTS)
+            action_buf[step] = movement_actions.reshape(train_config.num_envs, num_agents)
             message_slot_buf[step] = message_batch.slots.reshape(
-                train_config.num_envs, NUM_AGENTS, 3
+                train_config.num_envs, num_agents, n_slots
             )
-            logprob_buf[step] = combined_logprobs.reshape(train_config.num_envs, NUM_AGENTS)
+            logprob_buf[step] = combined_logprobs.reshape(train_config.num_envs, num_agents)
             value_buf[step] = values
 
             env_actions = _unflatten_symbolic_actions(
@@ -363,8 +464,8 @@ def train_mappo_symbolic(
                     episode_satisfaction.append(float(outcome["demand_satisfaction_rate"]))
                     obs, info = env.reset(seed=current_seed)
                     current_seed += 1
-                    start = env_id * NUM_AGENTS
-                    stop = start + NUM_AGENTS
+                    start = env_id * num_agents
+                    stop = start + num_agents
                     next_actor_hidden[start:stop] = 0.0
                 next_observations.append(obs)
                 next_infos.append(info)
@@ -390,13 +491,13 @@ def train_mappo_symbolic(
             returns = advantages + value_buf
 
         actor_obs = obs_buf.reshape(rollout_actor_batch, observation_dim)
-        actor_masks = mask_buf.reshape(rollout_actor_batch, ACTION_DIM)
+        actor_masks = mask_buf.reshape(rollout_actor_batch, action_dim)
         actor_actions = action_buf.reshape(rollout_actor_batch)
-        actor_slots = message_slot_buf.reshape(rollout_actor_batch, 3)
+        actor_slots = message_slot_buf.reshape(rollout_actor_batch, n_slots)
         old_logprobs = logprob_buf.reshape(rollout_actor_batch)
         actor_hidden_flat = hidden_buf.reshape(rollout_actor_batch, actor.hidden_dim)
         actor_advantages = (
-            advantages.unsqueeze(-1).expand(-1, -1, NUM_AGENTS).reshape(rollout_actor_batch)
+            advantages.unsqueeze(-1).expand(-1, -1, num_agents).reshape(rollout_actor_batch)
         )
         actor_advantages = (actor_advantages - actor_advantages.mean()) / (
             actor_advantages.std() + 1e-8
@@ -405,6 +506,24 @@ def train_mappo_symbolic(
         critic_obs = central_obs_buf.reshape(rollout_env_batch, central_observation_dim)
         critic_returns = returns.reshape(rollout_env_batch)
         flat_values = value_buf.reshape(rollout_env_batch)
+
+        with torch.no_grad():
+
+            def _empirical_entropy(tensor_1d: Tensor) -> float:
+                counts = torch.bincount(tensor_1d.long())
+                probs = counts.float() / counts.sum()
+                probs = probs[probs > 0]
+                return -(probs * torch.log2(probs)).sum().item()
+
+            if hasattr(channel, "slot_sizes") and len(channel.slot_sizes) >= 3:
+                h_claim = _empirical_entropy(actor_slots[:, 0])
+                h_node = _empirical_entropy(actor_slots[:, 1])
+                h_payload = _empirical_entropy(actor_slots[:, 2])
+                empirical_bits = h_claim + h_node + h_payload
+                non_null_fraction = (actor_slots[:, 0] != 7).float().mean().item()
+            else:
+                empirical_bits = _empirical_entropy(actor_slots[:, 0])
+                non_null_fraction = 1.0
 
         actor_indices = np.arange(rollout_actor_batch)
         critic_indices = np.arange(rollout_env_batch)
@@ -458,10 +577,16 @@ def train_mappo_symbolic(
                     )
                 new_values = critic(critic_obs[critic_mb])
                 value_loss = 0.5 * ((new_values - critic_returns[critic_mb]) ** 2).mean()
+                channel_loss = (
+                    channel.get_loss()
+                    if hasattr(channel, "get_loss")
+                    else torch.tensor(0.0, device=device)
+                )
                 loss = (
                     pg_loss
                     + train_config.value_coef * value_loss
                     - train_config.entropy_coef * entropy
+                    + channel_loss
                 )
 
                 optimizer.zero_grad()
@@ -494,6 +619,11 @@ def train_mappo_symbolic(
                     "charts/global_step": float(global_step),
                     "charts/recent_satisfaction": _recent_mean(episode_satisfaction),
                     "charts/value_mean": float(flat_values.mean().item()),
+                    "channel/empirical_bits": float(empirical_bits),
+                    "channel/h_claim": float(h_claim),
+                    "channel/h_node": float(h_node),
+                    "channel/h_payload": float(h_payload),
+                    "channel/non_null_fraction": float(non_null_fraction),
                 }
 
         if run is not None and (update % train_config.log_interval_updates == 0 or update == 1):
@@ -505,6 +635,7 @@ def train_mappo_symbolic(
         channel=channel,
         env_config=env_config,
         train_config=train_config,
+        channel_type=channel_type,
         channel_config=channel_config,
         global_step=global_step,
     )
@@ -530,42 +661,60 @@ def evaluate_symbolic_checkpoint(
     env_config: ResourceLogisticsConfig,
     episodes: int,
     seed: int,
+    attack: CommsAttack | None = None,
     device: str = "cpu",
 ) -> EvaluationResult:
     torch_device = torch.device(device)
     checkpoint = torch.load(checkpoint_path, map_location=torch_device, weights_only=False)
-    channel_config = SymbolicChannelConfig(**checkpoint["channel_config"])
+    channel_type = checkpoint.get("channel_type", "symbolic")
+    channel_config_raw = checkpoint.get("channel_config")
+    if isinstance(channel_config_raw, dict):
+        channel_config = channel_config_raw
+    else:
+        from dataclasses import asdict
+
+        channel_config = (
+            asdict(channel_config_raw)
+            if hasattr(channel_config_raw, "__dataclass_fields__")
+            else {}
+        )
+
     env_config = replace(
         env_config,
-        message_dim=channel_config.message_dim,
+        message_dim=int(channel_config.get("message_dim", 16)),
         message_history_length=5,
         replay_path=None,
     )
     observation_dim = env_config.observation_dim
     actor = MAPPOActor(
         observation_dim=observation_dim,
-        message_dim=channel_config.message_dim,
+        message_dim=int(channel_config.get("message_dim", 16)),
+        action_dim=env_config.action_dim,
+        base_observation_dim=env_config.base_observation_dim,
+        message_history_offset=env_config.message_history_offset,
     ).to(torch_device)
-    channel = SymbolicChannel(
+
+    if "channel_slot_sizes" in checkpoint:
+        channel_config["slot_sizes"] = checkpoint["channel_slot_sizes"]
+
+    channel = create_channel(
+        channel_type=channel_type,
         agent_intent_dim=actor.hidden_dim,
         observation_dim=observation_dim,
-        message_dim=channel_config.message_dim,
-        hidden_dim=channel_config.hidden_dim,
-        initial_temperature=channel_config.initial_temperature,
-        min_temperature=channel_config.min_temperature,
-        anneal_steps=channel_config.anneal_steps,
+        channel_config=channel_config,
     ).to(torch_device)
     actor.load_state_dict(checkpoint["actor"])
     channel.load_state_dict(checkpoint["channel"])
     actor.eval()
     channel.eval()
 
+    num_agents = env_config.num_agents
     satisfaction_rates: list[float] = []
     rewards: list[float] = []
     for episode in range(episodes):
         env = ResourceLogisticsEnv(config=env_config, seed=seed + episode)
         observations, infos = env.reset(seed=seed + episode)
-        hidden = actor.initial_hidden(NUM_AGENTS, torch_device)
+        hidden = actor.initial_hidden(num_agents, torch_device)
         done = False
         while not done:
             obs_tensor = _stack_single_env_observations(observations, env, torch_device)
@@ -573,7 +722,21 @@ def evaluate_symbolic_checkpoint(
             with torch.no_grad():
                 logits, hidden, agent_intents = actor.forward_step(obs_tensor, hidden, mask_tensor)
                 movement_actions = torch.argmax(logits, dim=-1)
-                message_batch = channel.deterministic_batch(agent_intents, obs_tensor)
+
+                final_intents = agent_intents
+                final_obs = obs_tensor
+                if attack is not None and hasattr(attack, "perturb_intents"):
+                    result = attack.perturb_intents(
+                        actor, obs_tensor, hidden, mask_tensor, env, env.step_count
+                    )
+                    if result is not None:
+                        final_intents, final_obs = result
+
+                message_batch = channel.deterministic_batch(final_intents, final_obs)
+
+                if attack is not None and not hasattr(attack, "perturb_intents"):
+                    message_batch = attack.perturb(message_batch, channel, env, env.step_count)
+
             action_dict = _single_env_symbolic_actions(
                 movement_actions.cpu().numpy(),
                 message_batch.embeddings.cpu().numpy(),
@@ -600,8 +763,11 @@ def evaluate_gate2(
     *,
     seed: int,
     resamples: int,
-    ippo_point_estimate: float = 0.34297380952380957,
-    ippo_upper_ci: float = 0.3578999404761905,
+    ippo_point_estimate: float,
+    ippo_upper_ci: float,
+    gate_low: float,
+    gate_high: float,
+    borderline_pass_low: float,
 ) -> Gate2Result:
     ci = bootstrap_success_ci(satisfaction_rates, seed=seed, resamples=resamples)
     point_gap = ci.mean - ippo_point_estimate
@@ -612,10 +778,10 @@ def evaluate_gate2(
     elif point_gap < 0.30:
         status = "borderline_gap_20_to_30pp"
         passed = False
-    elif 0.643 <= ci.mean < 0.70:
+    elif borderline_pass_low <= ci.mean < gate_low:
         status = "borderline_pass_gap_ok_below_band"
         passed = False
-    elif 0.70 <= ci.mean <= 0.85:
+    elif gate_low <= ci.mean <= gate_high:
         status = "passed"
         passed = True
     else:
@@ -655,7 +821,7 @@ def _stack_observations(
     device: torch.device,
 ) -> Tensor:
     arrays = [
-        [env_observations[f"agent_{agent_id}"] for agent_id in range(NUM_AGENTS)]
+        [env_observations[agent] for agent in sorted(env_observations.keys())]
         for env_observations in observations
     ]
     return torch.as_tensor(np.stack(arrays), dtype=torch.float32, device=device)
@@ -680,7 +846,7 @@ def _stack_action_masks(
     device: torch.device,
 ) -> Tensor:
     arrays = [
-        [env_infos[f"agent_{agent_id}"]["action_mask"] for agent_id in range(NUM_AGENTS)]
+        [env_infos[agent]["action_mask"] for agent in sorted(env_infos.keys())]
         for env_infos in infos
     ]
     return torch.as_tensor(np.stack(arrays), dtype=torch.bool, device=device)
@@ -756,35 +922,39 @@ def _save_checkpoint(
     *,
     actor: MAPPOActor,
     critic: CentralizedCritic,
-    channel: SymbolicChannel,
+    channel: nn.Module,
     env_config: ResourceLogisticsConfig,
     train_config: MAPPOTrainConfig,
-    channel_config: SymbolicChannelConfig,
+    channel_type: str,
+    channel_config: dict[str, Any],
     global_step: int,
 ) -> Path:
     checkpoint_dir = Path(train_config.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_name = train_config.checkpoint_name or f"mappo_symbolic_seed_{train_config.seed}.pt"
     checkpoint_path = checkpoint_dir / checkpoint_name
-    torch.save(
-        {
-            "actor": actor.state_dict(),
-            "critic": critic.state_dict(),
-            "channel": channel.state_dict(),
-            "env_config": env_config.to_dict(),
-            "train_config": asdict(train_config),
-            "channel_config": asdict(channel_config),
-            "global_step": global_step,
-        },
-        checkpoint_path,
-    )
+
+    save_dict = {
+        "actor": actor.state_dict(),
+        "critic": critic.state_dict(),
+        "channel": channel.state_dict(),
+        "env_config": env_config.to_dict(),
+        "train_config": asdict(train_config),
+        "channel_config": channel_config,
+        "channel_type": channel_type,
+        "global_step": global_step,
+    }
+    if hasattr(channel, "slot_sizes"):
+        save_dict["channel_slot_sizes"] = list(channel.slot_sizes)
+
+    torch.save(save_dict, checkpoint_path)
     return checkpoint_path
 
 
 def _start_wandb(
     train_config: MAPPOTrainConfig,
     env_config: ResourceLogisticsConfig,
-    channel_config: SymbolicChannelConfig,
+    channel_config: dict[str, Any],
 ) -> Any | None:
     if not train_config.track_wandb:
         return None
@@ -796,7 +966,7 @@ def _start_wandb(
         config={
             "train": asdict(train_config),
             "env": env_config.to_dict(),
-            "channel": asdict(channel_config),
+            "channel": channel_config,
         },
         mode=train_config.wandb_mode,
     )

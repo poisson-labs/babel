@@ -1,0 +1,53 @@
+# @package _global_
+
+defaults:
+  - /env: resource_logistics_v22
+  - /channel: symbolic_10bit
+  - _self_
+
+algorithm: mappo_symbolic
+mode: train_eval
+seeds: [0]
+device: cpu
+
+# MAPPO V22 continued: 30M total (loads 15M checkpoint, trains 15M more)
+total_timesteps: 30000000
+num_envs: 16
+rollout_length: 128
+ppo_epochs: 4
+minibatch_size: 1024
+learning_rate: 0.0003
+channel_learning_rate: 0.0001
+clip_coef: 0.2
+gae_lambda: 0.95
+gamma: 0.99
+entropy_coef: 0.01
+value_coef: 0.5
+max_grad_norm: 0.5
+log_interval_updates: 10
+
+# 10-bit symbolic channel: (8 claim, 32 node, 4 payload)
+channel_slot_sizes: [8, 32, 4]
+
+# Load the 15M checkpoint and continue training
+load_checkpoint: artifacts/checkpoints/mappo_symbolic_seed_0.pt
+
+eval_episodes: 500
+eval_seed: 900000
+bootstrap_resamples: 1000
+gate_low: 0.55
+gate_high: 0.85
+borderline_pass_low: 0.50
+ippo_point_estimate: 0.0203
+ippo_upper_ci: 0.0265
+
+checkpoint_dir: artifacts/checkpoints
+checkpoint_name: "mappo_symbolic_v22_30M_seed_0.pt"
+summary_path: artifacts/phase2_semantic_v22_30M_summary.json
+eval_checkpoint_paths: []
+
+wandb:
+  project: babel
+  group: phase2_semantic_v22_30M
+  mode: online
+  enabled: true

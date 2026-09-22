@@ -1,0 +1,5 @@
+message_dim: 16
+hidden_dim: 128
+model_name: "gpt2"
+num_soft_tokens: 8
+max_new_tokens: 16
